@@ -1,19 +1,73 @@
-# ArchiveSweep: bounded-window scheduler
+# ArchiveSweep: collision-safe file deduplication
 
-Collision-safe file deduplication (size filter, non-overlapping sample, streaming SHA-256,
-byte-for-byte verification) using one `ThreadPoolExecutor` and a **bounded submission window**.
+Finds files with exactly identical contents across one or more folders, and proves they match instead of guessing. Python standard library only.
 
-## What changed
+Pipeline: size filter, then non-overlapping head and tail sample, then streaming SHA-256, then byte-for-byte verification. Work runs on one `ThreadPoolExecutor` with a bounded submission window.
 
-The first version submitted one future per candidate file up front, so scheduler memory grew
-with the file count. Now `scan` keeps at most `window = 2 * max_workers` futures alive:
+## What it does
+
+- Walks the folders you give it recursively, without following symlinks.
+- Skips files with a unique size, since they cannot be duplicates.
+- Compares small samples from the start and end of each remaining file.
+- Fully hashes only the files that still match, in bounded-memory chunks.
+- Confirms each match byte for byte, so a hash collision cannot produce a false duplicate.
+- Reports each group as one canonical path (the lexically smallest), its duplicates, and the file size.
+- Lists files that fail to read as issues and keeps scanning.
+
+Most files are ruled out without being fully read, which avoids most of the I/O on a large archive.
+
+## Practical uses
+
+1. **Reclaiming disk space:** photo libraries, download folders and old backups often hold many copies of the same file.
+2. **Archive ingestion:** skip content that has already been received from another source.
+3. **Machine-learning datasets:** find exact duplicates between training and test folders that would inflate accuracy. Near-duplicates such as resized images are not detected.
+4. **Migration checks:** scan the old and new copies of a tree together. Every file should appear in a group with its counterpart.
+5. **Document and evidence review:** find identical attachments and exports, with a byte-level check behind each match.
+6. **Build caches and artifact stores:** find identical outputs that could be stored once.
+
+## Example
+
+```python
+from deduplicator import FileDeduplicator
+
+report = FileDeduplicator(max_workers=8).scan(["/photos", "/backup/photos"])
+
+reclaimable = sum(g.size * len(g.duplicates) for g in report.groups)
+print(f"{len(report.groups)} groups, {reclaimable / 1e9:.2f} GB reclaimable")
+
+for g in report.groups:
+    print("keep:", g.canonical)
+    for d in g.duplicates:
+        print("  copy:", d)
+
+for issue in report.issues:
+    print("skipped:", issue.path, "-", issue.error)
+```
+
+Treat this as a dry run. A typical next step is to replace copies with hard links or move them to a review folder, and delete only after checking the list.
+
+The constructor takes `max_workers` (default 4) and `sample_size` (default 4096). Both must be positive.
+
+## Limits
+
+- **Report only:** it never deletes or links anything. The canonical path is the alphabetically first one, which may not be the copy you want to keep.
+- **Hard links count as duplicates:** they share storage, so deleting one frees nothing. The reclaimable figure can be too high on trees that use hard links.
+- **Exact matches only:** it will not find the same photo at two resolutions or two edits of one document.
+- **Symlinks and special files** are skipped and reported as issues.
+- **Files changing during a scan** can produce issues or stale results (see the design reflection).
+- **Local filesystems only:** network and object storage would need changes (see the design reflection).
+- **Limited testing:** covered by the small suite in `test_bounded.py` and the demo below. It has not been run on terabyte-scale data or unusual filesystems, so try it on a copy first.
+
+## Bounded-window scheduler
+
+The first version submitted one future per candidate file up front, so scheduler memory grew with the file count. Now `scan` keeps at most `window = 2 * max_workers` futures alive:
 
 - Sample tasks come from a lazy generator, not a list of futures.
-- Files whose sample digests match go into a small `deque`; full-hash tasks are submitted from it first.
+- Files whose sample digests match go into a small `deque`, and full-hash tasks are submitted from it first.
 - Whenever futures finish, `fill()` tops the window back up.
 - The window is never below `max_workers`, so `max_workers` blocked hooks can still run together.
 
-## Results (real output of `demo_bounded_window.py`)
+### Results (real output of `demo_bounded_window.py`)
 
 `max_workers=4`, window = `2 * max_workers` = 8
 
@@ -31,17 +85,16 @@ with the file count. Now `scan` keeps at most `window = 2 * max_workers` futures
 - barrier of 4 blocked sample hooks releases: **True**
 - barrier of 8 blocked sample hooks releases: **True**
 
-## Caveats
+### Memory caveat
 
-- In-flight futures are O(`max_workers`). Discovery still stores one path and size per file, and
-  sample buckets store paths, so total memory is still O(files) in path strings, just far smaller
-  than one future per file. A truly O(1) walk would stream discovery lazily too.
-- Hard links are reported as duplicates (path identity, not inode identity).
+In-flight futures are O(`max_workers`). Discovery still stores one path and size per file, and the sample buckets store paths, so total memory is still O(files) in path strings, just far smaller than one future per file. A truly O(1) walk would stream discovery lazily too.
 
 ## Run
 
-    python3 demo_bounded_window.py
-    python3 -m pytest -q test_bounded.py
+```
+python3 demo_bounded_window.py
+python3 -m pytest -q test_bounded.py
+```
 
 ## Design reflection
 
