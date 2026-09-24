@@ -15,8 +15,6 @@ with the file count. Now `scan` keeps at most `window = 2 * max_workers` futures
 
 ## Results (real output of `demo_bounded_window.py`)
 
-# Bounded-window results
-
 `max_workers=4`, window = `2 * max_workers` = 8
 
 | files | strategy | peak futures in flight | peak traced MB | seconds | groups | issues |
